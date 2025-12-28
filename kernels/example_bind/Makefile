@@ -25,4 +25,5 @@ $(TARGET): $(SRC)
 
 # Clean target
 clean:
-	rm -f $(TARGET)$(shell python3-config --extension-suffix)
+	rm -f $(TARGET)$(shell python3-config --extension-suffix)|]]\
+	]
