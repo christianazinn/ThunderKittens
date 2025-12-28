@@ -1,4 +1,3 @@
-// timemix_binding.cu
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 #include "prototype.cuh"
