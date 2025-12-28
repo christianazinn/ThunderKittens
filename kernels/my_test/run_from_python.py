@@ -1,7 +1,7 @@
 # test_timemix.py
 import torch
 import torch.nn.functional as F
-import my_test  # Our compiled module
+import timemix_kernel  # Our compiled module
 import numpy as np
 
 def timemix_torch(x, x_prev, x_r, x_w, x_k, x_v, x_a, x_g):
@@ -30,7 +30,7 @@ def timemix_torch(x, x_prev, x_r, x_w, x_k, x_v, x_a, x_g):
     
     return xr, xw, xk, xv, xa, xg
 
-def test_my_test():
+def test_timemix_kernel():
     """Test the ThunderKittens kernel against PyTorch reference"""
     
     # Set random seed for reproducibility
@@ -86,7 +86,7 @@ def test_my_test():
     
     # Run ThunderKittens kernel
     print("\n2. Running ThunderKittens kernel...")
-    my_test.timemix(
+    timemix_kernel.timemix(
         x_kernel,
         x_prev_kernel,
         x_r_kernel,
@@ -233,7 +233,7 @@ def benchmark_timemix():
     
     # Warmup kernel
     for _ in range(num_warmup):
-        my_test.timemix(
+        timemix_kernel.timemix(
             x_kernel, x_prev_kernel,
             x_r_kernel, x_w_kernel, x_k_kernel, x_v_kernel, x_a_kernel, x_g_kernel,
             xr_out_kernel, xw_out_kernel, xk_out_kernel, 
@@ -244,7 +244,7 @@ def benchmark_timemix():
     # Benchmark kernel
     start = time.time()
     for _ in range(num_iters):
-        my_test.timemix(
+        timemix_kernel.timemix(
             x_kernel, x_prev_kernel,
             x_r_kernel, x_w_kernel, x_k_kernel, x_v_kernel, x_a_kernel, x_g_kernel,
             xr_out_kernel, xw_out_kernel, xk_out_kernel,
@@ -262,7 +262,7 @@ def benchmark_timemix():
 
 if __name__ == "__main__":
     # Run correctness test
-    test_passed = test_my_test()
+    test_passed = test_timemix_kernel()
     
     # Run benchmark if test passed
     if test_passed:
