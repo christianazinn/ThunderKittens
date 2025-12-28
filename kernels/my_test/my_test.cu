@@ -140,24 +140,36 @@ struct timemix_kernel_template {
         }
     };
     
-    // ========================================================================
+    // ============================================================================
     // CONSUMER
-    // ========================================================================
+    // ============================================================================
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
-            warpgroup::increase_registers<104>();
+            warpgroup::increase_registers<104>();  // Must be multiple of 8
         }
         
         __device__ static void compute(consumer_compute_args<layout> args) {
-            // Load tiles from shared memory to registers
-            warpgroup::load(args.state.x_reg, args.input.x);
-            warpgroup::load(args.state.xx_reg, args.input.x_prev);
+            // Use warp-level operations instead of warpgroup since we're
+            // distributing work across warps anyway
             
-            // Compute xx = x_prev - x
-            warpgroup::sub(args.state.xx_reg, args.state.xx_reg, args.state.x_reg);
+            // Only warp 0 loads shared data (avoid race conditions)
+            if (warpgroup::warpid() == 0) {
+                warp::load(args.state.x_reg, args.input.x);
+                warp::load(args.state.xx_reg, args.input.x_prev);
+                
+                // Compute xx = x_prev - x
+                warp::sub(args.state.xx_reg, args.state.xx_reg, args.state.x_reg);
+                
+                // Store xx to scratch
+                warp::store(args.scratch.xx, args.state.xx_reg);
+            }
             
-            // Store xx to scratch
-            warpgroup::store(args.scratch.xx, args.state.xx_reg);
+            // Wait for warp 0 to finish
+            __syncwarp();
+            
+            // Now all warps reload xx and x from shared memory
+            warp::load(args.state.xx_reg, args.scratch.xx);
+            warp::load(args.state.x_reg, args.input.x);
             
             // Distribute 6 outputs across 4 warps
             int warp_id = warpgroup::warpid();
@@ -166,40 +178,44 @@ struct timemix_kernel_template {
             
             for (int i = start_output; i < end_output; i++) {
                 // Load weight for this output
-                warpgroup::load(args.state.weight_reg, args.input.weights[i]);
+                warp::load(args.state.weight_reg, args.input.weights[i]);
                 
                 // Compute: result = xx * weight
-                warpgroup::mul(args.state.result_reg, 
-                              args.state.xx_reg, 
-                              args.state.weight_reg);
+                warp::mul(args.state.result_reg, 
+                        args.state.xx_reg, 
+                        args.state.weight_reg);
                 
                 // Compute: result = x + (xx * weight)
-                warpgroup::add(args.state.result_reg,
-                              args.state.x_reg,
-                              args.state.result_reg);
+                warp::add(args.state.result_reg,
+                        args.state.x_reg,
+                        args.state.result_reg);
                 
-                // Store to scratch (not finish - that's not accessible here)
-                warpgroup::store(args.scratch.outputs_temp[i], args.state.result_reg);
+                // Store to scratch
+                warp::store(args.scratch.outputs_temp[i], args.state.result_reg);
             }
             
-            warpgroup::sync();
+            // Make sure all warps finish before signaling
+            __syncwarp();
+            
             if (laneid() == 0) arrive(args.inputs_finished);
         }
         
         __device__ static void finish(consumer_finish_args<layout> args) {
-            // Copy from scratch to finish block
             int warp_id = warpgroup::warpid();
             
-            if (warp_id == 0) {
-                // Copy all 6 outputs from scratch to finish
-                for (int i = 0; i < 6; i++) {
-                    args.finish.outputs[i] = args.scratch.outputs_temp[i];
-                }
+            // Each warp copies some outputs
+            int start = warp_id * 2;
+            int end = min(start + 2, 6);
+            
+            for (int i = start; i < end; i++) {
+                // Direct assignment for shared memory tiles
+                args.finish.outputs[i] = args.scratch.outputs_temp[i];
             }
             
-            warpgroup::sync();
+            // Wait for all warps to finish copying
+            __syncwarp();
             
-            // Now store to global memory
+            // Now store to global memory (only warp 0)
             int batch = args.common.batch_idx;
             int t = args.common.timestep;
             
