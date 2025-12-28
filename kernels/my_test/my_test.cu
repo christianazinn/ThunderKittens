@@ -1,3 +1,4 @@
+// timemix_binding.cu
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 #include "prototype.cuh"
@@ -35,7 +36,7 @@ struct timemix_layout {
             int T = x.cols();
             return dim3(batch * T);
         }
-        dim3 block() { return dim3(64); }  // 2 warps total: 1 producer + 1 consumer
+        dim3 block() { return dim3(64); }
     };
     
     struct input_block {
@@ -45,6 +46,7 @@ struct timemix_layout {
     };
     
     struct scratch_block {
+        base_tile xx;  // Store xx here to reuse
         base_tile outputs_temp[6];
     };
     
@@ -58,11 +60,11 @@ struct timemix_layout {
     };
     
     struct consumer_state {
-        // Keep register tiles for the single warp
-        rt_bf<32, 32> x_reg;
-        rt_bf<32, 32> xx_reg;
-        rt_bf<32, 32> weight_reg;
-        rt_bf<32, 32> result_reg;
+        // Use smaller 16x16 tiles and process in 4 chunks
+        rt_bf<16, 16> x_chunk;
+        rt_bf<16, 16> xx_chunk;
+        rt_bf<16, 16> weight_chunk;
+        rt_bf<16, 16> result_chunk;
     };
 };
 
@@ -73,7 +75,7 @@ struct timemix_layout {
 struct timemix_kernel_template {
     using layout = timemix_layout;
     
-    static constexpr int NUM_CONSUMER_WARPS = 1;  // Single consumer warp
+    static constexpr int NUM_CONSUMER_WARPS = 1;
     static constexpr int INPUT_PIPE_STAGES = 2;
     static constexpr int PRODUCER_BARRIER_ARRIVALS = 1;
     
@@ -100,7 +102,6 @@ struct timemix_kernel_template {
                 int t = args.common.timestep;
                 
                 if (args.iter == 0) {
-                    // First iteration: load data + weights
                     tma::expect(args.inputs_arrived, args.input, 8);
                     
                     tma::load_async(args.input.x, args.globals.x,
@@ -133,40 +134,65 @@ struct timemix_kernel_template {
     };
     
     // ========================================================================
-    // CONSUMER - Single Warp
+    // CONSUMER - Work in chunks to reduce register pressure
     // ========================================================================
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
-            // Don't need to reallocate registers - single warp has plenty
+            // No register reallocation needed
         }
         
         __device__ static void compute(consumer_compute_args<layout> args) {
-            // Single warp does all the work
+            // Process the 32x32 tiles in 4 chunks of 16x16
+            // This dramatically reduces register usage
             
-            // Load x and x_prev from shared memory to registers
-            warp::load(args.state.x_reg, args.input.x);
-            warp::load(args.state.xx_reg, args.input.x_prev);
+            // First, compute xx = x_prev - x and store in shared memory
+            for (int chunk_row = 0; chunk_row < 2; chunk_row++) {
+                for (int chunk_col = 0; chunk_col < 2; chunk_col++) {
+                    // Load 16x16 chunks from 32x32 tiles
+                    auto x_subtile = subtile<16, 16>(args.input.x, {chunk_row, chunk_col});
+                    auto xprev_subtile = subtile<16, 16>(args.input.x_prev, {chunk_row, chunk_col});
+                    auto xx_subtile = subtile<16, 16>(args.scratch.xx, {chunk_row, chunk_col});
+                    
+                    warp::load(args.state.x_chunk, x_subtile);
+                    warp::load(args.state.xx_chunk, xprev_subtile);
+                    
+                    // xx = x_prev - x
+                    warp::sub(args.state.xx_chunk, args.state.xx_chunk, args.state.x_chunk);
+                    
+                    // Store xx back to shared memory for reuse
+                    warp::store(xx_subtile, args.state.xx_chunk);
+                }
+            }
             
-            // Compute xx = x_prev - x
-            warp::sub(args.state.xx_reg, args.state.xx_reg, args.state.x_reg);
-            
-            // Process all 6 outputs sequentially
-            for (int i = 0; i < 6; i++) {
-                // Load weight
-                warp::load(args.state.weight_reg, args.input.weights[i]);
-                
-                // result = xx * weight
-                warp::mul(args.state.result_reg, 
-                         args.state.xx_reg, 
-                         args.state.weight_reg);
-                
-                // result = x + (xx * weight)
-                warp::add(args.state.result_reg,
-                         args.state.x_reg,
-                         args.state.result_reg);
-                
-                // Store to scratch
-                warp::store(args.scratch.outputs_temp[i], args.state.result_reg);
+            // Now compute all 6 outputs
+            for (int output_idx = 0; output_idx < 6; output_idx++) {
+                for (int chunk_row = 0; chunk_row < 2; chunk_row++) {
+                    for (int chunk_col = 0; chunk_col < 2; chunk_col++) {
+                        // Get subtiles
+                        auto x_subtile = subtile<16, 16>(args.input.x, {chunk_row, chunk_col});
+                        auto xx_subtile = subtile<16, 16>(args.scratch.xx, {chunk_row, chunk_col});
+                        auto weight_subtile = subtile<16, 16>(args.input.weights[output_idx], {chunk_row, chunk_col});
+                        auto result_subtile = subtile<16, 16>(args.scratch.outputs_temp[output_idx], {chunk_row, chunk_col});
+                        
+                        // Load chunks
+                        warp::load(args.state.x_chunk, x_subtile);
+                        warp::load(args.state.xx_chunk, xx_subtile);
+                        warp::load(args.state.weight_chunk, weight_subtile);
+                        
+                        // result = xx * weight
+                        warp::mul(args.state.result_chunk, 
+                                 args.state.xx_chunk, 
+                                 args.state.weight_chunk);
+                        
+                        // result = x + (xx * weight)
+                        warp::add(args.state.result_chunk,
+                                 args.state.x_chunk,
+                                 args.state.result_chunk);
+                        
+                        // Store result chunk
+                        warp::store(result_subtile, args.state.result_chunk);
+                    }
+                }
             }
             
             if (laneid() == 0) arrive(args.inputs_finished);
@@ -178,7 +204,7 @@ struct timemix_kernel_template {
                 args.finish.outputs[i] = args.scratch.outputs_temp[i];
             }
             
-            // Store all outputs to global memory
+            // Store all outputs
             int batch = args.common.batch_idx;
             int t = args.common.timestep;
             
