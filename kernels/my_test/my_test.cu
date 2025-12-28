@@ -1,3 +1,4 @@
+// timemix_binding.cu
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 #include "prototype.cuh"
@@ -7,10 +8,9 @@ using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
 
 // ============================================================================
-// SIMPLIFIED TIMEMIX KERNEL (Non-templated for easier binding)
+// LAYOUT DEFINITION
 // ============================================================================
 
-// Layout for the timemix kernel
 struct timemix_layout {
     using base_tile = st_bf<32, 32>;
     using global_layout = gl<bf16, -1, -1, 32, 32, base_tile>;
@@ -33,11 +33,11 @@ struct timemix_layout {
         
         // Grid/block configuration
         dim3 grid()  { 
-            int batch = x.batch;
-            int T = x.cols;
-            return dim3(batch * T);  // One block per (batch, timestep)
+            int batch = x.batch();   // Call as function
+            int T = x.cols();        // Call as function
+            return dim3(batch * T);
         }
-        dim3 block() { return dim3(128); }  // 128 threads = 4 warps = 1 warpgroup
+        dim3 block() { return dim3(128); }
     };
     
     struct input_block {
@@ -48,6 +48,7 @@ struct timemix_layout {
     
     struct scratch_block {
         base_tile xx;
+        base_tile outputs_temp[6];  // Store outputs here during compute
     };
     
     struct finish_block {
@@ -67,7 +68,10 @@ struct timemix_layout {
     };
 };
 
-// Simple template for single timestep per block
+// ============================================================================
+// KERNEL TEMPLATE
+// ============================================================================
+
 struct timemix_kernel_template {
     using layout = timemix_layout;
     
@@ -76,7 +80,7 @@ struct timemix_kernel_template {
     static constexpr int PRODUCER_BARRIER_ARRIVALS = 1;
     
     __device__ static inline void common_setup(common_setup_args<layout> args) {
-        int T = args.globals.x.cols;
+        int T = args.globals.x.cols();  // Call as function
         int total_task = blockIdx.x;
         
         args.common.batch_idx = total_task / T;
@@ -84,28 +88,14 @@ struct timemix_kernel_template {
         args.num_iters = 1;
     }
     
+    // ========================================================================
+    // PRODUCER
+    // ========================================================================
     struct producer {
         __device__ static void setup(producer_setup_args<layout> args) {
             warpgroup::decrease_registers<40>();
-            
-            // Load weights once during setup
-            if (warpgroup::warpid() == 0 && args.iter == 0) {
-                tma::expect_bytes(args.inputs_arrived, 
-                                 sizeof(typename layout::base_tile) * 6);
-                
-                tma::load_async(args.input.weights[0], args.globals.x_r,
-                               {0, 0, 0, 0}, args.inputs_arrived);
-                tma::load_async(args.input.weights[1], args.globals.x_w,
-                               {0, 0, 0, 0}, args.inputs_arrived);
-                tma::load_async(args.input.weights[2], args.globals.x_k,
-                               {0, 0, 0, 0}, args.inputs_arrived);
-                tma::load_async(args.input.weights[3], args.globals.x_v,
-                               {0, 0, 0, 0}, args.inputs_arrived);
-                tma::load_async(args.input.weights[4], args.globals.x_a,
-                               {0, 0, 0, 0}, args.inputs_arrived);
-                tma::load_async(args.input.weights[5], args.globals.x_g,
-                               {0, 0, 0, 0}, args.inputs_arrived);
-            }
+            // Note: Can't load weights here - no access to input_block or barriers
+            // Weights will be loaded in the first load() call
         }
         
         __device__ static void load(producer_load_args<layout> args) {
@@ -113,53 +103,83 @@ struct timemix_kernel_template {
                 int batch = args.common.batch_idx;
                 int t = args.common.timestep;
                 
-                tma::expect(args.inputs_arrived, args.input, 2);
-                
-                tma::load_async(args.input.x, args.globals.x,
-                               {batch, t, 0, 0}, args.inputs_arrived);
-                tma::load_async(args.input.x_prev, args.globals.x_prev,
-                               {batch, t, 0, 0}, args.inputs_arrived);
+                // On first iteration, also load the weight vectors
+                if (args.iter == 0) {
+                    // Expect: 2 data tiles (x, x_prev) + 6 weight tiles
+                    tma::expect(args.inputs_arrived, args.input, 8);
+                    
+                    // Load x and x_prev
+                    tma::load_async(args.input.x, args.globals.x,
+                                   {batch, t, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.x_prev, args.globals.x_prev,
+                                   {batch, t, 0, 0}, args.inputs_arrived);
+                    
+                    // Load all 6 weight vectors
+                    tma::load_async(args.input.weights[0], args.globals.x_r,
+                                   {0, 0, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.weights[1], args.globals.x_w,
+                                   {0, 0, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.weights[2], args.globals.x_k,
+                                   {0, 0, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.weights[3], args.globals.x_v,
+                                   {0, 0, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.weights[4], args.globals.x_a,
+                                   {0, 0, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.weights[5], args.globals.x_g,
+                                   {0, 0, 0, 0}, args.inputs_arrived);
+                } else {
+                    // Subsequent iterations: just load x and x_prev
+                    tma::expect(args.inputs_arrived, args.input, 2);
+                    
+                    tma::load_async(args.input.x, args.globals.x,
+                                   {batch, t, 0, 0}, args.inputs_arrived);
+                    tma::load_async(args.input.x_prev, args.globals.x_prev,
+                                   {batch, t, 0, 0}, args.inputs_arrived);
+                }
             }
         }
     };
     
+    // ========================================================================
+    // CONSUMER
+    // ========================================================================
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
             warpgroup::increase_registers<100>();
         }
         
         __device__ static void compute(consumer_compute_args<layout> args) {
-            // Load tiles into registers
+            // Load tiles from shared memory to registers
             warpgroup::load(args.state.x_reg, args.input.x);
             warpgroup::load(args.state.xx_reg, args.input.x_prev);
             
             // Compute xx = x_prev - x
             warpgroup::sub(args.state.xx_reg, args.state.xx_reg, args.state.x_reg);
+            
+            // Store xx to scratch
             warpgroup::store(args.scratch.xx, args.state.xx_reg);
             
             // Distribute 6 outputs across 4 warps
-            // Warp 0: outputs 0, 1
-            // Warp 1: outputs 2, 3
-            // Warp 2: outputs 4, 5
-            // Warp 3: idle
             int warp_id = warpgroup::warpid();
             int start_output = warp_id * 2;
             int end_output = min(start_output + 2, 6);
             
             for (int i = start_output; i < end_output; i++) {
+                // Load weight for this output
                 warpgroup::load(args.state.weight_reg, args.input.weights[i]);
                 
-                // result = xx * weight
+                // Compute: result = xx * weight
                 warpgroup::mul(args.state.result_reg, 
                               args.state.xx_reg, 
                               args.state.weight_reg);
                 
-                // result = x + (xx * weight)
+                // Compute: result = x + (xx * weight)
                 warpgroup::add(args.state.result_reg,
                               args.state.x_reg,
                               args.state.result_reg);
                 
-                warpgroup::store(args.finish.outputs[i], args.state.result_reg);
+                // Store to scratch (not finish - that's not accessible here)
+                warpgroup::store(args.scratch.outputs_temp[i], args.state.result_reg);
             }
             
             warpgroup::sync();
@@ -167,10 +187,23 @@ struct timemix_kernel_template {
         }
         
         __device__ static void finish(consumer_finish_args<layout> args) {
+            // Copy from scratch to finish block
+            int warp_id = warpgroup::warpid();
+            
+            if (warp_id == 0) {
+                // Copy all 6 outputs from scratch to finish
+                for (int i = 0; i < 6; i++) {
+                    copy(args.finish.outputs[i], args.scratch.outputs_temp[i]);
+                }
+            }
+            
+            warpgroup::sync();
+            
+            // Now store to global memory
             int batch = args.common.batch_idx;
             int t = args.common.timestep;
             
-            if (warpgroup::warpid() == 0) {
+            if (warp_id == 0) {
                 tma::store_async(args.globals.xr_out, args.finish.outputs[0],
                                 {batch, t, 0, 0});
                 tma::store_async_read_wait();
@@ -201,7 +234,10 @@ struct timemix_kernel_template {
     };
 };
 
-// Wrapper function for easier binding
+// ============================================================================
+// WRAPPER FUNCTION
+// ============================================================================
+
 void run_timemix_kernel(timemix_layout::globals g) {
     unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
     cudaFuncSetAttribute(prototype::lcf::kernel<timemix_kernel_template>,
@@ -219,8 +255,6 @@ void run_timemix_kernel(timemix_layout::globals g) {
 PYBIND11_MODULE(timemix_kernel, m) {
     m.doc() = "ThunderKittens TimeMix kernel for RWKV-style time mixing";
     
-    // Bind the kernel
-    // Lists all the input and output tensors in order
     py::bind_function<run_timemix_kernel>(
         m, "timemix",
         &timemix_layout::globals::x,
