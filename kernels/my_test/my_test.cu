@@ -193,7 +193,7 @@ struct timemix_kernel_template {
             if (warp_id == 0) {
                 // Copy all 6 outputs from scratch to finish
                 for (int i = 0; i < 6; i++) {
-                    copy(args.finish.outputs[i], args.scratch.outputs_temp[i]);
+                    kittens::copy(args.finish.outputs[i], args.scratch.outputs_temp[i]);
                 }
             }
             
