@@ -180,11 +180,11 @@ def benchmark_timemix():
     
     import time
     
-    batch = 4
-    T = 128
+    batch = 1
+    T = 32
     D = 1024
-    num_warmup = 10
-    num_iters = 100
+    num_warmup = 2
+    num_iters = 10
     
     device = 'cuda'
     dtype = torch.bfloat16
@@ -265,5 +265,5 @@ if __name__ == "__main__":
     test_passed = test_timemix_kernel()
     
     # Run benchmark if test passed
-    if test_passed:
-        benchmark_timemix()
+    # if test_passed:
+    #     benchmark_timemix()
