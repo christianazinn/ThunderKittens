@@ -145,7 +145,7 @@ struct timemix_kernel_template {
     // ========================================================================
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
-            warpgroup::increase_registers<100>();
+            warpgroup::increase_registers<104>();
         }
         
         __device__ static void compute(consumer_compute_args<layout> args) {
