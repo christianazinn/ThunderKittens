@@ -34,7 +34,7 @@ struct timemix_layout {
             return dim3(batch * T);  // One block per (batch, timestep)
         }
         dim3 block() { 
-            return dim3(256);  // 8 warps, plenty of threads
+            return dim3(256);  // 8 warps
         }
     };
 };
@@ -43,11 +43,14 @@ __global__ void timemix_kernel(const __grid_constant__ timemix_layout::globals g
     using base_tile = timemix_layout::base_tile;
     
     // Shared memory for computation
-    __shared__ base_tile smem_x;
-    __shared__ base_tile smem_x_prev;
-    __shared__ base_tile smem_xx;
-    __shared__ base_tile smem_weight;
-    __shared__ base_tile smem_result;
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    
+    base_tile &smem_x = al.allocate<base_tile>();
+    base_tile &smem_x_prev = al.allocate<base_tile>();
+    base_tile &smem_xx = al.allocate<base_tile>();
+    base_tile &smem_weight = al.allocate<base_tile>();
+    base_tile &smem_result = al.allocate<base_tile>();
     
     int T = g.x.cols();
     int total_idx = blockIdx.x;
@@ -56,116 +59,65 @@ __global__ void timemix_kernel(const __grid_constant__ timemix_layout::globals g
     int t = total_idx % T;
     
     int tid = threadIdx.x;
-    constexpr int num_elements = 32 * 32;  // Elements in 32x32 tile
+    constexpr int num_elements = 32 * 32;
     
-    // Load x and x_prev
-    load(smem_x, g.x, {batch_idx, t, 0, 0});
-    load(smem_x_prev, g.x_prev, {batch_idx, t, 0, 0});
+    // Load x and x_prev using TMA
+    if (tid == 0) {
+        tma::load_async(smem_x, g.x, {batch_idx, t, 0, 0});
+        tma::load_async(smem_x_prev, g.x_prev, {batch_idx, t, 0, 0});
+    }
+    tma::arrive_and_wait();
     __syncthreads();
     
-    // Compute xx = x_prev - x (elementwise, all threads participate)
+    // Compute xx = x_prev - x (elementwise)
     for (int i = tid; i < num_elements; i += blockDim.x) {
         int row = i / 32;
         int col = i % 32;
-        smem_xx(row, col) = smem_x_prev(row, col) - smem_x(row, col);
+        smem_xx.data[i] = smem_x_prev.data[i] - smem_x.data[i];
     }
     __syncthreads();
     
-    // Process all 6 outputs sequentially
-    // Each output: result = x + xx * weight
+    // Helper lambda for computing output
+    auto compute_output = [&](auto& weight_global, auto& output_global) {
+        // Load weight
+        if (tid == 0) {
+            tma::load_async(smem_weight, weight_global, {0, 0, 0, 0});
+        }
+        tma::arrive_and_wait();
+        __syncthreads();
+        
+        // Compute result = x + xx * weight
+        for (int i = tid; i < num_elements; i += blockDim.x) {
+            float xx_val = __bfloat162float(smem_xx.data[i]);
+            float weight_val = __bfloat162float(smem_weight.data[i]);
+            float x_val = __bfloat162float(smem_x.data[i]);
+            smem_result.data[i] = __float2bfloat16(x_val + xx_val * weight_val);
+        }
+        __syncthreads();
+        
+        // Store result
+        if (tid == 0) {
+            tma::store_async(output_global, smem_result, {batch_idx, t, 0, 0});
+            tma::store_async_wait();
+        }
+        __syncthreads();
+    };
     
-    // Output 0: xr
-    load(smem_weight, g.x_r, {0, 0, 0, 0});
-    __syncthreads();
-    for (int i = tid; i < num_elements; i += blockDim.x) {
-        int row = i / 32;
-        int col = i % 32;
-        float xx_val = __bfloat162float(smem_xx(row, col));
-        float weight_val = __bfloat162float(smem_weight(row, col));
-        float x_val = __bfloat162float(smem_x(row, col));
-        smem_result(row, col) = __float2bfloat16(x_val + xx_val * weight_val);
-    }
-    __syncthreads();
-    store(g.xr_out, smem_result, {batch_idx, t, 0, 0});
-    __syncthreads();
-    
-    // Output 1: xw
-    load(smem_weight, g.x_w, {0, 0, 0, 0});
-    __syncthreads();
-    for (int i = tid; i < num_elements; i += blockDim.x) {
-        int row = i / 32;
-        int col = i % 32;
-        float xx_val = __bfloat162float(smem_xx(row, col));
-        float weight_val = __bfloat162float(smem_weight(row, col));
-        float x_val = __bfloat162float(smem_x(row, col));
-        smem_result(row, col) = __float2bfloat16(x_val + xx_val * weight_val);
-    }
-    __syncthreads();
-    store(g.xw_out, smem_result, {batch_idx, t, 0, 0});
-    __syncthreads();
-    
-    // Output 2: xk
-    load(smem_weight, g.x_k, {0, 0, 0, 0});
-    __syncthreads();
-    for (int i = tid; i < num_elements; i += blockDim.x) {
-        int row = i / 32;
-        int col = i % 32;
-        float xx_val = __bfloat162float(smem_xx(row, col));
-        float weight_val = __bfloat162float(smem_weight(row, col));
-        float x_val = __bfloat162float(smem_x(row, col));
-        smem_result(row, col) = __float2bfloat16(x_val + xx_val * weight_val);
-    }
-    __syncthreads();
-    store(g.xk_out, smem_result, {batch_idx, t, 0, 0});
-    __syncthreads();
-    
-    // Output 3: xv
-    load(smem_weight, g.x_v, {0, 0, 0, 0});
-    __syncthreads();
-    for (int i = tid; i < num_elements; i += blockDim.x) {
-        int row = i / 32;
-        int col = i % 32;
-        float xx_val = __bfloat162float(smem_xx(row, col));
-        float weight_val = __bfloat162float(smem_weight(row, col));
-        float x_val = __bfloat162float(smem_x(row, col));
-        smem_result(row, col) = __float2bfloat16(x_val + xx_val * weight_val);
-    }
-    __syncthreads();
-    store(g.xv_out, smem_result, {batch_idx, t, 0, 0});
-    __syncthreads();
-    
-    // Output 4: xa
-    load(smem_weight, g.x_a, {0, 0, 0, 0});
-    __syncthreads();
-    for (int i = tid; i < num_elements; i += blockDim.x) {
-        int row = i / 32;
-        int col = i % 32;
-        float xx_val = __bfloat162float(smem_xx(row, col));
-        float weight_val = __bfloat162float(smem_weight(row, col));
-        float x_val = __bfloat162float(smem_x(row, col));
-        smem_result(row, col) = __float2bfloat16(x_val + xx_val * weight_val);
-    }
-    __syncthreads();
-    store(g.xa_out, smem_result, {batch_idx, t, 0, 0});
-    __syncthreads();
-    
-    // Output 5: xg
-    load(smem_weight, g.x_g, {0, 0, 0, 0});
-    __syncthreads();
-    for (int i = tid; i < num_elements; i += blockDim.x) {
-        int row = i / 32;
-        int col = i % 32;
-        float xx_val = __bfloat162float(smem_xx(row, col));
-        float weight_val = __bfloat162float(smem_weight(row, col));
-        float x_val = __bfloat162float(smem_x(row, col));
-        smem_result(row, col) = __float2bfloat16(x_val + xx_val * weight_val);
-    }
-    __syncthreads();
-    store(g.xg_out, smem_result, {batch_idx, t, 0, 0});
+    // Process all 6 outputs
+    compute_output(g.x_r, g.xr_out);
+    compute_output(g.x_w, g.xw_out);
+    compute_output(g.x_k, g.xk_out);
+    compute_output(g.x_v, g.xv_out);
+    compute_output(g.x_a, g.xa_out);
+    compute_output(g.x_g, g.xg_out);
 }
 
 void run_timemix_kernel(timemix_layout::globals g) {
-    timemix_kernel<<<g.grid(), g.block()>>>(g);
+    unsigned long mem_size = 5 * sizeof(st_bf<32, 32>) + 1024;  // 5 tiles + extra
+    cudaFuncSetAttribute(timemix_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        mem_size);
+    timemix_kernel<<<g.grid(), g.block(), mem_size>>>(g);
 }
 
 // ============================================================================
