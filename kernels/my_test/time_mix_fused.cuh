@@ -248,11 +248,11 @@ void run_time_mix_prefill(prefill_globals g) {
     prototype::lcf::kernel<kernel><<<g.grid(), g.block()>>>(lg);
 }
 
-PYBIND11_MODULE(timemix_kernel, m) {
+PYBIND11_MODULE(time_mix_tk, m) {
     m.doc() = "ThunderKittens fused time-mixing kernel for RWKV";
     
     // Decode kernel (T=1)
-    py::bind_function<run_time_mix_decode>(m, "timemix_decode",
+    py::bind_function<run_time_mix_decode>(m, "time_mix_decode",
         &decode_globals::x, &decode_globals::x_prev,
         &decode_globals::x_r, &decode_globals::x_w, &decode_globals::x_k,
         &decode_globals::x_v, &decode_globals::x_a, &decode_globals::x_g,
@@ -260,7 +260,7 @@ PYBIND11_MODULE(timemix_kernel, m) {
         &decode_globals::out_v, &decode_globals::out_a, &decode_globals::out_g);
     
     // Prefill kernel (T=16 chunks)
-    py::bind_function<run_time_mix_prefill>(m, "timemix_prefill",
+    py::bind_function<run_time_mix_prefill>(m, "time_mix_prefill",
         &prefill_globals::x, &prefill_globals::x_prev,
         &prefill_globals::x_r, &prefill_globals::x_w, &prefill_globals::x_k,
         &prefill_globals::x_v, &prefill_globals::x_a, &prefill_globals::x_g,
