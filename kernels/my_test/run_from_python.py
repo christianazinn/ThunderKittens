@@ -233,7 +233,7 @@ def benchmark_timemix():
     
     # Warmup kernel
     for _ in range(num_warmup):
-        timemix_kernel.timemix_prefill(
+        timemix_kernel.timemix(
             x_kernel, x_prev_kernel,
             x_r_kernel, x_w_kernel, x_k_kernel, x_v_kernel, x_a_kernel, x_g_kernel,
             xr_out_kernel, xw_out_kernel, xk_out_kernel, 
@@ -244,7 +244,7 @@ def benchmark_timemix():
     # Benchmark kernel
     start = time.time()
     for _ in range(num_iters):
-        timemix_kernel.timemix_prefill(
+        timemix_kernel.timemix(
             x_kernel, x_prev_kernel,
             x_r_kernel, x_w_kernel, x_k_kernel, x_v_kernel, x_a_kernel, x_g_kernel,
             xr_out_kernel, xw_out_kernel, xk_out_kernel,
