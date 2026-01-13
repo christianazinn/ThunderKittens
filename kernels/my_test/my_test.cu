@@ -18,7 +18,7 @@ struct timemix_layout {
         global_layout x_r;
         global_layout x_w;
         global_layout x_k;
-        global_layout x_v;
+        glob\al_layout x_v;
         global_layout x_a;
         global_layout x_g;
         global_layout xr_out;
